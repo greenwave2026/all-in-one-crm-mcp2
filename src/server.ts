@@ -1,80 +1,118 @@
 import express from "express";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { z } from "zod";
 
-const PORT = Number(process.env.PORT || 3000);
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
 const MCP_API_KEY = process.env.MCP_API_KEY || "";
 
-type CrmName = "zigaflow" | "spruce" | "servicem8";
+type CRM = "zigaflow" | "spruce" | "servicem8";
 
-type CrmConfig = {
-  name: CrmName;
-  label: string;
-  baseUrl?: string;
-  apiKey?: string;
-};
-
-const crms: CrmConfig[] = [
-  {
-    name: "zigaflow",
+const crmConfig = {
+  zigaflow: {
     label: "Zigaflow",
     baseUrl: process.env.ZIGAFLOW_BASE_URL,
     apiKey: process.env.ZIGAFLOW_API_KEY
   },
-  {
-    name: "spruce",
+  spruce: {
     label: "Spruce",
     baseUrl: process.env.SPRUCE_BASE_URL,
     apiKey: process.env.SPRUCE_API_KEY
   },
-  {
-    name: "servicem8",
+  servicem8: {
     label: "ServiceM8",
     baseUrl: process.env.SERVICEM8_BASE_URL,
     apiKey: process.env.SERVICEM8_API_KEY
   }
-];
+};
 
-function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+function checkAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
   if (!MCP_API_KEY) return next();
 
-  const auth = req.header("authorization") || "";
-  const token = auth.replace(/^Bearer\s+/i, "");
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.replace(/^Bearer\s+/i, "");
 
   if (token !== MCP_API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
+    return res.status(401).json({
+      jsonrpc: "2.0",
+      error: {
+        code: -32001,
+        message: "Unauthorized"
+      },
+      id: null
+    });
   }
 
   next();
 }
 
-function getCrm(name: CrmName): CrmConfig {
-  const crm = crms.find((c) => c.name === name);
-  if (!crm) throw new Error(`Unknown CRM: ${name}`);
-  if (!crm.baseUrl) throw new Error(`${crm.label} base URL is missing`);
-  if (!crm.apiKey) throw new Error(`${crm.label} API key is missing`);
-  return crm;
+function mcpResult(id: any, result: any) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    result
+  };
 }
 
-async function crmGet(crm: CrmConfig, path: string, query?: Record<string, string>) {
+function mcpError(id: any, code: number, message: string) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code,
+      message
+    }
+  };
+}
+
+function getTargets(crm: CRM | "all") {
+  if (crm === "all") {
+    return Object.entries(crmConfig)
+      .filter(([, config]) => config.baseUrl && config.apiKey)
+      .map(([key, config]) => ({
+        key: key as CRM,
+        ...config
+      }));
+  }
+
+  const config = crmConfig[crm];
+
+  if (!config.baseUrl || !config.apiKey) {
+    throw new Error(`${config.label} is not configured in Render environment variables.`);
+  }
+
+  return [
+    {
+      key: crm,
+      ...config
+    }
+  ];
+}
+
+async function crmGet(
+  crm: {
+    label: string;
+    baseUrl?: string;
+    apiKey?: string;
+  },
+  path: string,
+  query: Record<string, string> = {}
+) {
   if (!crm.baseUrl || !crm.apiKey) {
-    throw new Error(`${crm.label} is not configured`);
+    throw new Error(`${crm.label} is missing baseUrl or apiKey.`);
   }
 
   const url = new URL(path, crm.baseUrl);
 
-  if (query) {
-    for (const [key, value] of Object.entries(query)) {
-      if (value) url.searchParams.set(key, value);
-    }
+  for (const [key, value] of Object.entries(query)) {
+    if (value) url.searchParams.set(key, value);
   }
 
   const response = await fetch(url.toString(), {
     method: "GET",
     headers: {
-      "Authorization": `Bearer ${crm.apiKey}`,
-      "Accept": "application/json"
+      Authorization: `Bearer ${crm.apiKey}`,
+      Accept: "application/json"
     }
   });
 
@@ -91,206 +129,218 @@ async function crmGet(crm: CrmConfig, path: string, query?: Record<string, strin
   }
 }
 
-const server = new McpServer({
-  name: "all-in-one-crm-mcp",
-  version: "1.0.0"
-});
-
-server.tool(
-  "list_connected_crms",
-  "List which CRM connectors are configured on the MCP server.",
-  {},
-  async () => {
-    const configured = crms.map((crm) => ({
-      crm: crm.name,
-      label: crm.label,
-      configured: Boolean(crm.baseUrl && crm.apiKey)
-    }));
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(configured, null, 2)
+const tools = [
+  {
+    name: "list_connected_crms",
+    description: "List which CRM connectors are configured on the server.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: "search_crm_records",
+    description: "Search read-only CRM records across Zigaflow, Spruce, ServiceM8, or all configured CRMs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        crm: {
+          type: "string",
+          enum: ["zigaflow", "spruce", "servicem8", "all"]
+        },
+        query: {
+          type: "string",
+          description: "Customer name, company, email, phone, job reference, deal keyword, or search text."
+        },
+        limit: {
+          type: "number",
+          default: 10
         }
-      ]
-    };
-  }
-);
-
-server.tool(
-  "search_crm_records",
-  "Search CRM records across Zigaflow, Spruce, ServiceM8, or all configured CRMs. Read-only.",
-  {
-    crm: z.enum(["zigaflow", "spruce", "servicem8", "all"]),
-    query: z.string().describe("Search text, customer name, company, phone, email, job reference, or deal keyword."),
-    limit: z.number().int().min(1).max(50).default(10)
-  },
-  async ({ crm, query, limit }) => {
-    const targets = crm === "all" ? crms.filter((c) => c.baseUrl && c.apiKey) : [getCrm(crm)];
-
-    const results = [];
-
-    for (const target of targets) {
-      try {
-        // TODO: Replace `/search` with the real endpoint for each CRM.
-        const data = await crmGet(target, "/search", {
-          q: query,
-          limit: String(limit)
-        });
-
-        results.push({
-          crm: target.label,
-          ok: true,
-          data
-        });
-      } catch (error) {
-        results.push({
-          crm: target.label,
-          ok: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
-      }
+      },
+      required: ["crm", "query"]
     }
-
-    return {
-      content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
-    };
-  }
-);
-
-server.tool(
-  "get_pipeline_summary",
-  "Get a read-only pipeline or sales/work summary from configured CRMs.",
-  {
-    crm: z.enum(["zigaflow", "spruce", "servicem8", "all"]),
-    period: z.string().default("today").describe("Example: today, yesterday, this_week, last_7_days, this_month")
   },
-  async ({ crm, period }) => {
-    const targets = crm === "all" ? crms.filter((c) => c.baseUrl && c.apiKey) : [getCrm(crm)];
-
-    const results = [];
-
-    for (const target of targets) {
-      try {
-        // TODO: Replace `/pipeline/summary` with each CRM's real endpoint.
-        const data = await crmGet(target, "/pipeline/summary", { period });
-        results.push({ crm: target.label, ok: true, data });
-      } catch (error) {
-        results.push({
-          crm: target.label,
-          ok: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
-      }
+  {
+    name: "get_pipeline_summary",
+    description: "Get a read-only pipeline or sales/work summary from configured CRMs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        crm: {
+          type: "string",
+          enum: ["zigaflow", "spruce", "servicem8", "all"]
+        },
+        period: {
+          type: "string",
+          default: "today",
+          description: "Example: today, yesterday, this_week, last_7_days, this_month."
+        }
+      },
+      required: ["crm"]
     }
-
-    return {
-      content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
-    };
-  }
-);
-
-server.tool(
-  "get_recent_activity",
-  "Get recent customer, sales, job, note, task, or follow-up activity. Read-only.",
-  {
-    crm: z.enum(["zigaflow", "spruce", "servicem8", "all"]),
-    limit: z.number().int().min(1).max(100).default(25)
   },
-  async ({ crm, limit }) => {
-    const targets = crm === "all" ? crms.filter((c) => c.baseUrl && c.apiKey) : [getCrm(crm)];
-
-    const results = [];
-
-    for (const target of targets) {
-      try {
-        // TODO: Replace `/activity/recent` with each CRM's real endpoint.
-        const data = await crmGet(target, "/activity/recent", {
-          limit: String(limit)
-        });
-
-        results.push({ crm: target.label, ok: true, data });
-      } catch (error) {
-        results.push({
-          crm: target.label,
-          ok: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
-      }
+  {
+    name: "get_recent_activity",
+    description: "Get recent customer, sales, job, note, task, or follow-up activity. Read-only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        crm: {
+          type: "string",
+          enum: ["zigaflow", "spruce", "servicem8", "all"]
+        },
+        limit: {
+          type: "number",
+          default: 25
+        }
+      },
+      required: ["crm"]
     }
-
-    return {
-      content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
-    };
-  }
-);
-
-server.tool(
-  "get_followups_due",
-  "Get upcoming or overdue follow-ups, tasks, calls, reminders, or jobs. Read-only.",
-  {
-    crm: z.enum(["zigaflow", "spruce", "servicem8", "all"]),
-    window: z.string().default("next_7_days")
   },
-  async ({ crm, window }) => {
-    const targets = crm === "all" ? crms.filter((c) => c.baseUrl && c.apiKey) : [getCrm(crm)];
-
-    const results = [];
-
-    for (const target of targets) {
-      try {
-        // TODO: Replace `/followups/due` with each CRM's real endpoint.
-        const data = await crmGet(target, "/followups/due", { window });
-        results.push({ crm: target.label, ok: true, data });
-      } catch (error) {
-        results.push({
-          crm: target.label,
-          ok: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
-      }
+  {
+    name: "get_followups_due",
+    description: "Get upcoming or overdue follow-ups, tasks, calls, reminders, or jobs. Read-only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        crm: {
+          type: "string",
+          enum: ["zigaflow", "spruce", "servicem8", "all"]
+        },
+        window: {
+          type: "string",
+          default: "next_7_days"
+        }
+      },
+      required: ["crm"]
     }
-
-    return {
-      content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
-    };
-  }
-);
-
-server.tool(
-  "get_daily_digest",
-  "Generate raw CRM data for a daily digest across configured CRMs. Read-only.",
-  {
-    date: z.string().optional().describe("Optional YYYY-MM-DD date. Defaults to today.")
   },
-  async ({ date }) => {
-    const configuredCrms = crms.filter((c) => c.baseUrl && c.apiKey);
+  {
+    name: "get_daily_digest",
+    description: "Get raw CRM data for a daily digest across configured CRMs. Read-only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        date: {
+          type: "string",
+          description: "Optional YYYY-MM-DD date. Defaults to today."
+        }
+      },
+      required: []
+    }
+  }
+];
 
+async function callTool(name: string, args: any) {
+  if (name === "list_connected_crms") {
+    return Object.entries(crmConfig).map(([key, config]) => ({
+      crm: key,
+      label: config.label,
+      configured: Boolean(config.baseUrl && config.apiKey)
+    }));
+  }
+
+  if (name === "search_crm_records") {
+    const targets = getTargets(args.crm);
     const results = [];
 
-    for (const crm of configuredCrms) {
+    for (const crm of targets) {
       try {
-        // TODO: Replace `/digest/daily` with each CRM's real endpoint.
-        const data = await crmGet(crm, "/digest/daily", date ? { date } : undefined);
+        // TODO: Replace /search with each CRM's real search endpoint.
+        const data = await crmGet(crm, "/search", {
+          q: args.query,
+          limit: String(args.limit || 10)
+        });
         results.push({ crm: crm.label, ok: true, data });
       } catch (error) {
-        results.push({
-          crm: crm.label,
-          ok: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
+        results.push({ crm: crm.label, ok: false, error: String(error) });
       }
     }
 
-    return {
-      content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
-    };
+    return results;
   }
-);
 
-const app = express();
-app.use(express.json({ limit: "2mb" }));
+  if (name === "get_pipeline_summary") {
+    const targets = getTargets(args.crm);
+    const results = [];
+
+    for (const crm of targets) {
+      try {
+        // TODO: Replace /pipeline/summary with each CRM's real endpoint.
+        const data = await crmGet(crm, "/pipeline/summary", {
+          period: args.period || "today"
+        });
+        results.push({ crm: crm.label, ok: true, data });
+      } catch (error) {
+        results.push({ crm: crm.label, ok: false, error: String(error) });
+      }
+    }
+
+    return results;
+  }
+
+  if (name === "get_recent_activity") {
+    const targets = getTargets(args.crm);
+    const results = [];
+
+    for (const crm of targets) {
+      try {
+        // TODO: Replace /activity/recent with each CRM's real endpoint.
+        const data = await crmGet(crm, "/activity/recent", {
+          limit: String(args.limit || 25)
+        });
+        results.push({ crm: crm.label, ok: true, data });
+      } catch (error) {
+        results.push({ crm: crm.label, ok: false, error: String(error) });
+      }
+    }
+
+    return results;
+  }
+
+  if (name === "get_followups_due") {
+    const targets = getTargets(args.crm);
+    const results = [];
+
+    for (const crm of targets) {
+      try {
+        // TODO: Replace /followups/due with each CRM's real endpoint.
+        const data = await crmGet(crm, "/followups/due", {
+          window: args.window || "next_7_days"
+        });
+        results.push({ crm: crm.label, ok: true, data });
+      } catch (error) {
+        results.push({ crm: crm.label, ok: false, error: String(error) });
+      }
+    }
+
+    return results;
+  }
+
+  if (name === "get_daily_digest") {
+    const targets = getTargets("all");
+    const results = [];
+
+    for (const crm of targets) {
+      try {
+        // TODO: Replace /digest/daily with each CRM's real endpoint.
+        const data = await crmGet(
+          crm,
+          "/digest/daily",
+          args.date ? { date: args.date } : {}
+        );
+        results.push({ crm: crm.label, ok: true, data });
+      } catch (error) {
+        results.push({ crm: crm.label, ok: false, error: String(error) });
+      }
+    }
+
+    return results;
+  }
+
+  throw new Error(`Unknown tool: ${name}`);
+}
 
 app.get("/", (_req, res) => {
   res.json({
@@ -300,17 +350,61 @@ app.get("/", (_req, res) => {
   });
 });
 
-app.post("/mcp", requireAuth, async (req, res) => {
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined
-  });
+app.post("/mcp", checkAuth, async (req, res) => {
+  const { id, method, params } = req.body || {};
 
-  res.on("close", () => {
-    transport.close();
-  });
+  try {
+    if (method === "initialize") {
+      return res.json(
+        mcpResult(id, {
+          protocolVersion: "2024-11-05",
+          capabilities: {
+            tools: {}
+          },
+          serverInfo: {
+            name: "all-in-one-crm-mcp",
+            version: "1.0.0"
+          }
+        })
+      );
+    }
 
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+    if (method === "notifications/initialized") {
+      return res.status(204).send();
+    }
+
+    if (method === "tools/list") {
+      return res.json(
+        mcpResult(id, {
+          tools
+        })
+      );
+    }
+
+    if (method === "tools/call") {
+      const toolName = params?.name;
+      const toolArgs = params?.arguments || {};
+
+      const result = await callTool(toolName, toolArgs);
+
+      return res.json(
+        mcpResult(id, {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2)
+            }
+          ]
+        })
+      );
+    }
+
+    return res.json(mcpError(id, -32601, `Method not found: ${method}`));
+  } catch (error) {
+    return res.json(
+      mcpError(id, -32000, error instanceof Error ? error.message : String(error))
+    );
+  }
 });
 
 app.listen(PORT, () => {
