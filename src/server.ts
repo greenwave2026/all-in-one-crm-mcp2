@@ -129,6 +129,13 @@ async function crmGet(
   }
 }
 
+const readOnlyAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: true
+};
+
 const tools = [
   {
     name: "list_connected_crms",
@@ -137,7 +144,8 @@ const tools = [
       type: "object",
       properties: {},
       required: []
-    }
+    },
+    annotations: readOnlyAnnotations
   },
   {
     name: "search_crm_records",
@@ -159,7 +167,8 @@ const tools = [
         }
       },
       required: ["crm", "query"]
-    }
+    },
+    annotations: readOnlyAnnotations
   },
   {
     name: "get_pipeline_summary",
@@ -173,12 +182,12 @@ const tools = [
         },
         period: {
           type: "string",
-          default: "today",
-          description: "Example: today, yesterday, this_week, last_7_days, this_month."
+          default: "today"
         }
       },
       required: ["crm"]
-    }
+    },
+    annotations: readOnlyAnnotations
   },
   {
     name: "get_recent_activity",
@@ -196,7 +205,8 @@ const tools = [
         }
       },
       required: ["crm"]
-    }
+    },
+    annotations: readOnlyAnnotations
   },
   {
     name: "get_followups_due",
@@ -214,7 +224,8 @@ const tools = [
         }
       },
       required: ["crm"]
-    }
+    },
+    annotations: readOnlyAnnotations
   },
   {
     name: "get_daily_digest",
@@ -228,7 +239,8 @@ const tools = [
         }
       },
       required: []
-    }
+    },
+    annotations: readOnlyAnnotations
   }
 ];
 
@@ -247,11 +259,11 @@ async function callTool(name: string, args: any) {
 
     for (const crm of targets) {
       try {
-        // TODO: Replace /search with each CRM's real search endpoint.
         const data = await crmGet(crm, "/search", {
           q: args.query,
           limit: String(args.limit || 10)
         });
+
         results.push({ crm: crm.label, ok: true, data });
       } catch (error) {
         results.push({ crm: crm.label, ok: false, error: String(error) });
@@ -267,10 +279,10 @@ async function callTool(name: string, args: any) {
 
     for (const crm of targets) {
       try {
-        // TODO: Replace /pipeline/summary with each CRM's real endpoint.
         const data = await crmGet(crm, "/pipeline/summary", {
           period: args.period || "today"
         });
+
         results.push({ crm: crm.label, ok: true, data });
       } catch (error) {
         results.push({ crm: crm.label, ok: false, error: String(error) });
@@ -286,10 +298,10 @@ async function callTool(name: string, args: any) {
 
     for (const crm of targets) {
       try {
-        // TODO: Replace /activity/recent with each CRM's real endpoint.
         const data = await crmGet(crm, "/activity/recent", {
           limit: String(args.limit || 25)
         });
+
         results.push({ crm: crm.label, ok: true, data });
       } catch (error) {
         results.push({ crm: crm.label, ok: false, error: String(error) });
@@ -305,10 +317,10 @@ async function callTool(name: string, args: any) {
 
     for (const crm of targets) {
       try {
-        // TODO: Replace /followups/due with each CRM's real endpoint.
         const data = await crmGet(crm, "/followups/due", {
           window: args.window || "next_7_days"
         });
+
         results.push({ crm: crm.label, ok: true, data });
       } catch (error) {
         results.push({ crm: crm.label, ok: false, error: String(error) });
@@ -324,12 +336,12 @@ async function callTool(name: string, args: any) {
 
     for (const crm of targets) {
       try {
-        // TODO: Replace /digest/daily with each CRM's real endpoint.
         const data = await crmGet(
           crm,
           "/digest/daily",
           args.date ? { date: args.date } : {}
         );
+
         results.push({ crm: crm.label, ok: true, data });
       } catch (error) {
         results.push({ crm: crm.label, ok: false, error: String(error) });
