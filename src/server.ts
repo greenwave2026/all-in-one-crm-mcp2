@@ -1,7 +1,7 @@
 import express from "express";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
 const MCP_API_KEY = process.env.MCP_API_KEY || "";
@@ -11,18 +11,24 @@ type CRM = "zigaflow" | "spruce" | "servicem8";
 const crmConfig = {
   zigaflow: {
     label: "Zigaflow",
-    baseUrl: process.env.ZIGAFLOW_BASE_URL,
-    apiKey: process.env.ZIGAFLOW_API_KEY
+    baseUrl: process.env.ZIGAFLOW_BASE_URL || "https://api.zigaflow.com",
+    apiKey: process.env.ZIGAFLOW_API_KEY,
+    authHeader: process.env.ZIGAFLOW_AUTH_HEADER || "Authorization",
+    authScheme: process.env.ZIGAFLOW_AUTH_SCHEME || "Bearer"
   },
   spruce: {
     label: "Spruce",
     baseUrl: process.env.SPRUCE_BASE_URL,
-    apiKey: process.env.SPRUCE_API_KEY
+    apiKey: process.env.SPRUCE_API_KEY,
+    authHeader: process.env.SPRUCE_AUTH_HEADER || "Authorization",
+    authScheme: process.env.SPRUCE_AUTH_SCHEME || "Bearer"
   },
   servicem8: {
     label: "ServiceM8",
     baseUrl: process.env.SERVICEM8_BASE_URL,
-    apiKey: process.env.SERVICEM8_API_KEY
+    apiKey: process.env.SERVICEM8_API_KEY,
+    authHeader: process.env.SERVICEM8_AUTH_HEADER || "Authorization",
+    authScheme: process.env.SERVICEM8_AUTH_SCHEME || "Bearer"
   }
 };
 
@@ -35,10 +41,7 @@ function checkAuth(req: express.Request, res: express.Response, next: express.Ne
   if (token !== MCP_API_KEY) {
     return res.status(401).json({
       jsonrpc: "2.0",
-      error: {
-        code: -32001,
-        message: "Unauthorized"
-      },
+      error: { code: -32001, message: "Unauthorized" },
       id: null
     });
   }
@@ -47,79 +50,64 @@ function checkAuth(req: express.Request, res: express.Response, next: express.Ne
 }
 
 function mcpResult(id: any, result: any) {
-  return {
-    jsonrpc: "2.0",
-    id,
-    result
-  };
+  return { jsonrpc: "2.0", id, result };
 }
 
 function mcpError(id: any, code: number, message: string) {
-  return {
-    jsonrpc: "2.0",
-    id,
-    error: {
-      code,
-      message
-    }
-  };
+  return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
-function getTargets(crm: CRM | "all") {
-  if (crm === "all") {
-    return Object.entries(crmConfig)
-      .filter(([, config]) => config.baseUrl && config.apiKey)
-      .map(([key, config]) => ({
-        key: key as CRM,
-        ...config
-      }));
+function authValue(config: {
+  apiKey?: string;
+  authScheme?: string;
+}) {
+  if (!config.apiKey) return "";
+
+  if (!config.authScheme || config.authScheme.toLowerCase() === "none") {
+    return config.apiKey;
   }
 
-  const config = crmConfig[crm];
-
-  if (!config.baseUrl || !config.apiKey) {
-    throw new Error(`${config.label} is not configured in Render environment variables.`);
-  }
-
-  return [
-    {
-      key: crm,
-      ...config
-    }
-  ];
+  return `${config.authScheme} ${config.apiKey}`;
 }
 
-async function crmGet(
-  crm: {
+async function apiGet(
+  config: {
     label: string;
     baseUrl?: string;
     apiKey?: string;
+    authHeader?: string;
+    authScheme?: string;
   },
   path: string,
-  query: Record<string, string> = {}
+  query: Record<string, string | number | boolean | undefined> = {}
 ) {
-  if (!crm.baseUrl || !crm.apiKey) {
-    throw new Error(`${crm.label} is missing baseUrl or apiKey.`);
+  if (!config.baseUrl || !config.apiKey) {
+    throw new Error(`${config.label} is missing base URL or API key in Render.`);
   }
 
-  const url = new URL(path, crm.baseUrl);
+  const url = new URL(path, config.baseUrl);
 
   for (const [key, value] of Object.entries(query)) {
-    if (value) url.searchParams.set(key, value);
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
   }
+
+  const headers: Record<string, string> = {
+    Accept: "application/json"
+  };
+
+  headers[config.authHeader || "Authorization"] = authValue(config);
 
   const response = await fetch(url.toString(), {
     method: "GET",
-    headers: {
-      Authorization: `Bearer ${crm.apiKey}`,
-      Accept: "application/json"
-    }
+    headers
   });
 
   const text = await response.text();
 
   if (!response.ok) {
-    throw new Error(`${crm.label} API error ${response.status}: ${text}`);
+    throw new Error(`${config.label} API error ${response.status}: ${text}`);
   }
 
   try {
@@ -127,6 +115,38 @@ async function crmGet(
   } catch {
     return { raw: text };
   }
+}
+
+function normalizeList(data: any) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.data)) return data.data;
+  if (Array.isArray(data?.items)) return data.items;
+  if (Array.isArray(data?.results)) return data.results;
+  return data;
+}
+
+function containsText(value: any, query: string): boolean {
+  return JSON.stringify(value || {})
+    .toLowerCase()
+    .includes(query.toLowerCase());
+}
+
+function filterLocally(data: any, query: string) {
+  const list = normalizeList(data);
+
+  if (!Array.isArray(list)) return data;
+
+  return list.filter((item) => containsText(item, query));
+}
+
+function isoDaysAgo(days: number) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return d.toISOString().slice(0, 19).replace("T", " ");
+}
+
+function todayIsoDate() {
+  return new Date().toISOString().slice(0, 10);
 }
 
 const readOnlyAnnotations = {
@@ -159,7 +179,7 @@ const tools = [
         },
         query: {
           type: "string",
-          description: "Customer name, company, email, phone, job reference, deal keyword, or search text."
+          description: "Customer name, company, email, phone, job reference, quote reference, ticket keyword, or search text."
         },
         limit: {
           type: "number",
@@ -182,7 +202,7 @@ const tools = [
         },
         period: {
           type: "string",
-          default: "today"
+          default: "last_7_days"
         }
       },
       required: ["crm"]
@@ -191,7 +211,7 @@ const tools = [
   },
   {
     name: "get_recent_activity",
-    description: "Get recent customer, sales, job, note, task, or follow-up activity. Read-only.",
+    description: "Get recent customer, sales, job, note, task, ticket, quotation, or follow-up activity. Read-only.",
     inputSchema: {
       type: "object",
       properties: {
@@ -210,7 +230,7 @@ const tools = [
   },
   {
     name: "get_followups_due",
-    description: "Get upcoming or overdue follow-ups, tasks, calls, reminders, or jobs. Read-only.",
+    description: "Get upcoming or overdue follow-ups, tasks, reminders, or jobs. Read-only.",
     inputSchema: {
       type: "object",
       properties: {
@@ -244,6 +264,206 @@ const tools = [
   }
 ];
 
+async function zigaflowSearch(query: string, limit: number) {
+  const z = crmConfig.zigaflow;
+
+  const results: any[] = [];
+
+  // Direct exact-match helpers
+  if (query.includes("@")) {
+    try {
+      const contactByEmail = await apiGet(z, "/v1/contacts/getbyemail", { email: query });
+      results.push({ type: "contact_by_email", data: contactByEmail });
+    } catch (error) {
+      results.push({ type: "contact_by_email", error: String(error) });
+    }
+  }
+
+  try {
+    const clientByName = await apiGet(z, "/v1/clients/getByName", { name: query });
+    results.push({ type: "client_by_name", data: clientByName });
+  } catch (error) {
+    results.push({ type: "client_by_name", error: String(error) });
+  }
+
+  // Broad list reads with local filtering
+  const top = Math.min(Math.max(limit * 5, 25), 100);
+
+  const sources = [
+    { type: "clients", path: "/v1/clients", query: { top } },
+    { type: "contacts", path: "/v1/contacts", query: { top } },
+    { type: "jobs", path: "/v1/jobs", query: { top, expand: true, includeComments: true } },
+    { type: "tickets", path: "/v1/tickets", query: { top } },
+    { type: "quotations", path: "/v1/quotations", query: { top } },
+    { type: "events", path: "/v1/events", query: { top } }
+  ];
+
+  for (const source of sources) {
+    try {
+      const data = await apiGet(z, source.path, source.query);
+      const filtered = filterLocally(data, query);
+      results.push({
+        type: source.type,
+        data: Array.isArray(filtered) ? filtered.slice(0, limit) : filtered
+      });
+    } catch (error) {
+      results.push({ type: source.type, error: String(error) });
+    }
+  }
+
+  return results;
+}
+
+async function zigaflowPipelineSummary(period: string) {
+  const z = crmConfig.zigaflow;
+  const createdFrom = period === "today" ? `${todayIsoDate()} 00:00` : isoDaysAgo(7);
+
+  const output: any = {};
+
+  try {
+    output.pipelineTypes = await apiGet(z, "/v1/pipeline");
+  } catch (error) {
+    output.pipelineTypesError = String(error);
+  }
+
+  try {
+    output.jobs = await apiGet(z, "/v1/jobs", {
+      createdFrom,
+      top: 50,
+      expand: true,
+      includeLinkedOrders: true,
+      includeComments: true
+    });
+  } catch (error) {
+    output.jobsError = String(error);
+  }
+
+  try {
+    output.quotations = await apiGet(z, "/v1/quotations", {
+      createdFrom,
+      top: 50
+    });
+  } catch (error) {
+    output.quotationsError = String(error);
+  }
+
+  try {
+    output.tickets = await apiGet(z, "/v1/tickets", {
+      createdFrom,
+      top: 50
+    });
+  } catch (error) {
+    output.ticketsError = String(error);
+  }
+
+  return output;
+}
+
+async function zigaflowRecentActivity(limit: number) {
+  const z = crmConfig.zigaflow;
+  const since = isoDaysAgo(7);
+  const top = Math.min(Math.max(limit, 10), 100);
+
+  const output: any = {};
+
+  const reads = [
+    ["clients", "/v1/clients", { createdFrom: since, top }],
+    ["contacts", "/v1/contacts", { top }],
+    ["jobs", "/v1/jobs", { lastUpdatedFrom: since, top, expand: true, includeComments: true }],
+    ["events", "/v1/events", { createdFrom: since, top }],
+    ["tickets", "/v1/tickets", { updatedFrom: since, top }],
+    ["quotations", "/v1/quotations", { lastUpdatedFrom: since, top }]
+  ] as const;
+
+  for (const [key, path, query] of reads) {
+    try {
+      output[key] = await apiGet(z, path, query);
+    } catch (error) {
+      output[`${key}Error`] = String(error);
+    }
+  }
+
+  return output;
+}
+
+async function zigaflowFollowupsDue(window: string) {
+  const z = crmConfig.zigaflow;
+
+  const output: any = {
+    window
+  };
+
+  try {
+    output.events = await apiGet(z, "/v1/events", {
+      top: 100
+    });
+  } catch (error) {
+    output.eventsError = String(error);
+  }
+
+  try {
+    output.jobs = await apiGet(z, "/v1/jobs", {
+      top: 50,
+      expand: true,
+      includeComments: true
+    });
+  } catch (error) {
+    output.jobsError = String(error);
+  }
+
+  try {
+    output.tickets = await apiGet(z, "/v1/tickets", {
+      top: 50
+    });
+  } catch (error) {
+    output.ticketsError = String(error);
+  }
+
+  return output;
+}
+
+async function zigaflowDailyDigest(date?: string) {
+  const z = crmConfig.zigaflow;
+  const targetDate = date || todayIsoDate();
+  const from = `${targetDate} 00:00`;
+  const to = `${targetDate} 23:59`;
+
+  const output: any = {
+    date: targetDate
+  };
+
+  const reads = [
+    ["clientsCreated", "/v1/clients", { createdFrom: from, createdTo: to, top: 50 }],
+    ["jobsCreated", "/v1/jobs", { createdFrom: from, createdTo: to, top: 50, expand: true, includeComments: true }],
+    ["jobsUpdated", "/v1/jobs", { lastUpdatedFrom: from, lastUpdatedTo: to, top: 50, expand: true, includeComments: true }],
+    ["events", "/v1/events", { createdFrom: from, createdTo: to, top: 50 }],
+    ["ticketsCreated", "/v1/tickets", { createdFrom: from, createdTo: to, top: 50 }],
+    ["ticketsUpdated", "/v1/tickets", { updatedFrom: from, updatedTo: to, top: 50 }],
+    ["quotationsCreated", "/v1/quotations", { createdFrom: from, createdTo: to, top: 50 }],
+    ["quotationsUpdated", "/v1/quotations", { lastUpdatedFrom: from, lastUpdatedTo: to, top: 50 }]
+  ] as const;
+
+  for (const [key, path, query] of reads) {
+    try {
+      output[key] = await apiGet(z, path, query);
+    } catch (error) {
+      output[`${key}Error`] = String(error);
+    }
+  }
+
+  return output;
+}
+
+async function placeholderCrmCall(crm: CRM, action: string) {
+  const config = crmConfig[crm];
+
+  return {
+    crm: config.label,
+    ok: false,
+    message: `${config.label} is still using placeholder MCP code for ${action}. Add that CRM's real API endpoints before this tool can return live data.`
+  };
+}
+
 async function callTool(name: string, args: any) {
   if (name === "list_connected_crms") {
     return Object.entries(crmConfig).map(([key, config]) => ({
@@ -254,99 +474,135 @@ async function callTool(name: string, args: any) {
   }
 
   if (name === "search_crm_records") {
-    const targets = getTargets(args.crm);
-    const results = [];
+    const crm = args.crm as CRM | "all";
+    const query = args.query;
+    const limit = Number(args.limit || 10);
 
-    for (const crm of targets) {
+    const results: any[] = [];
+
+    if (crm === "zigaflow" || crm === "all") {
       try {
-        const data = await crmGet(crm, "/search", {
-          q: args.query,
-          limit: String(args.limit || 10)
+        results.push({
+          crm: "Zigaflow",
+          ok: true,
+          data: await zigaflowSearch(query, limit)
         });
-
-        results.push({ crm: crm.label, ok: true, data });
       } catch (error) {
-        results.push({ crm: crm.label, ok: false, error: String(error) });
+        results.push({ crm: "Zigaflow", ok: false, error: String(error) });
       }
+    }
+
+    if (crm === "spruce" || crm === "all") {
+      results.push(await placeholderCrmCall("spruce", "search_crm_records"));
+    }
+
+    if (crm === "servicem8" || crm === "all") {
+      results.push(await placeholderCrmCall("servicem8", "search_crm_records"));
     }
 
     return results;
   }
 
   if (name === "get_pipeline_summary") {
-    const targets = getTargets(args.crm);
-    const results = [];
+    const crm = args.crm as CRM | "all";
+    const period = args.period || "last_7_days";
+    const results: any[] = [];
 
-    for (const crm of targets) {
+    if (crm === "zigaflow" || crm === "all") {
       try {
-        const data = await crmGet(crm, "/pipeline/summary", {
-          period: args.period || "today"
+        results.push({
+          crm: "Zigaflow",
+          ok: true,
+          data: await zigaflowPipelineSummary(period)
         });
-
-        results.push({ crm: crm.label, ok: true, data });
       } catch (error) {
-        results.push({ crm: crm.label, ok: false, error: String(error) });
+        results.push({ crm: "Zigaflow", ok: false, error: String(error) });
       }
+    }
+
+    if (crm === "spruce" || crm === "all") {
+      results.push(await placeholderCrmCall("spruce", "get_pipeline_summary"));
+    }
+
+    if (crm === "servicem8" || crm === "all") {
+      results.push(await placeholderCrmCall("servicem8", "get_pipeline_summary"));
     }
 
     return results;
   }
 
   if (name === "get_recent_activity") {
-    const targets = getTargets(args.crm);
-    const results = [];
+    const crm = args.crm as CRM | "all";
+    const limit = Number(args.limit || 25);
+    const results: any[] = [];
 
-    for (const crm of targets) {
+    if (crm === "zigaflow" || crm === "all") {
       try {
-        const data = await crmGet(crm, "/activity/recent", {
-          limit: String(args.limit || 25)
+        results.push({
+          crm: "Zigaflow",
+          ok: true,
+          data: await zigaflowRecentActivity(limit)
         });
-
-        results.push({ crm: crm.label, ok: true, data });
       } catch (error) {
-        results.push({ crm: crm.label, ok: false, error: String(error) });
+        results.push({ crm: "Zigaflow", ok: false, error: String(error) });
       }
+    }
+
+    if (crm === "spruce" || crm === "all") {
+      results.push(await placeholderCrmCall("spruce", "get_recent_activity"));
+    }
+
+    if (crm === "servicem8" || crm === "all") {
+      results.push(await placeholderCrmCall("servicem8", "get_recent_activity"));
     }
 
     return results;
   }
 
   if (name === "get_followups_due") {
-    const targets = getTargets(args.crm);
-    const results = [];
+    const crm = args.crm as CRM | "all";
+    const window = args.window || "next_7_days";
+    const results: any[] = [];
 
-    for (const crm of targets) {
+    if (crm === "zigaflow" || crm === "all") {
       try {
-        const data = await crmGet(crm, "/followups/due", {
-          window: args.window || "next_7_days"
+        results.push({
+          crm: "Zigaflow",
+          ok: true,
+          data: await zigaflowFollowupsDue(window)
         });
-
-        results.push({ crm: crm.label, ok: true, data });
       } catch (error) {
-        results.push({ crm: crm.label, ok: false, error: String(error) });
+        results.push({ crm: "Zigaflow", ok: false, error: String(error) });
       }
+    }
+
+    if (crm === "spruce" || crm === "all") {
+      results.push(await placeholderCrmCall("spruce", "get_followups_due"));
+    }
+
+    if (crm === "servicem8" || crm === "all") {
+      results.push(await placeholderCrmCall("servicem8", "get_followups_due"));
     }
 
     return results;
   }
 
   if (name === "get_daily_digest") {
-    const targets = getTargets("all");
-    const results = [];
+    const date = args.date;
+    const results: any[] = [];
 
-    for (const crm of targets) {
-      try {
-        const data = await crmGet(
-          crm,
-          "/digest/daily",
-          args.date ? { date: args.date } : {}
-        );
-
-        results.push({ crm: crm.label, ok: true, data });
-      } catch (error) {
-        results.push({ crm: crm.label, ok: false, error: String(error) });
-      }
+    try {
+      results.push({
+        crm: "Zigaflow",
+        ok: true,
+        data: await zigaflowDailyDigest(date)
+      });
+    } catch (error) {
+      results.push({ crm: "Zigaflow", ok: false, error: String(error) });
     }
+
+    results.push(await placeholderCrmCall("spruce", "get_daily_digest"));
+    results.push(await placeholderCrmCall("servicem8", "get_daily_digest"));
 
     return results;
   }
@@ -370,9 +626,7 @@ app.post("/mcp", checkAuth, async (req, res) => {
       return res.json(
         mcpResult(id, {
           protocolVersion: "2024-11-05",
-          capabilities: {
-            tools: {}
-          },
+          capabilities: { tools: {} },
           serverInfo: {
             name: "all-in-one-crm-mcp",
             version: "1.0.0"
@@ -386,17 +640,12 @@ app.post("/mcp", checkAuth, async (req, res) => {
     }
 
     if (method === "tools/list") {
-      return res.json(
-        mcpResult(id, {
-          tools
-        })
-      );
+      return res.json(mcpResult(id, { tools }));
     }
 
     if (method === "tools/call") {
       const toolName = params?.name;
       const toolArgs = params?.arguments || {};
-
       const result = await callTool(toolName, toolArgs);
 
       return res.json(
