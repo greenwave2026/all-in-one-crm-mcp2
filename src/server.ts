@@ -8,27 +8,39 @@ const MCP_API_KEY = process.env.MCP_API_KEY || "";
 
 type CRM = "zigaflow" | "spruce" | "servicem8";
 
-const crmConfig = {
+type CrmConfig = {
+  label: string;
+  baseUrl?: string;
+  apiKey?: string;
+  authHeader?: string;
+  authScheme?: string;
+  authLocation?: "header" | "query";
+};
+
+const crmConfig: Record<CRM, CrmConfig> = {
   zigaflow: {
     label: "Zigaflow",
     baseUrl: process.env.ZIGAFLOW_BASE_URL || "https://api.zigaflow.com",
     apiKey: process.env.ZIGAFLOW_API_KEY,
-    authHeader: process.env.ZIGAFLOW_AUTH_HEADER || "Authorization",
-    authScheme: process.env.ZIGAFLOW_AUTH_SCHEME || "Bearer"
+    authHeader: process.env.ZIGAFLOW_AUTH_HEADER || "api_key",
+    authScheme: process.env.ZIGAFLOW_AUTH_SCHEME || "none",
+    authLocation: (process.env.ZIGAFLOW_AUTH_LOCATION as "header" | "query") || "query"
   },
   spruce: {
     label: "Spruce",
     baseUrl: process.env.SPRUCE_BASE_URL,
     apiKey: process.env.SPRUCE_API_KEY,
     authHeader: process.env.SPRUCE_AUTH_HEADER || "Authorization",
-    authScheme: process.env.SPRUCE_AUTH_SCHEME || "Bearer"
+    authScheme: process.env.SPRUCE_AUTH_SCHEME || "Bearer",
+    authLocation: (process.env.SPRUCE_AUTH_LOCATION as "header" | "query") || "header"
   },
   servicem8: {
     label: "ServiceM8",
     baseUrl: process.env.SERVICEM8_BASE_URL,
     apiKey: process.env.SERVICEM8_API_KEY,
     authHeader: process.env.SERVICEM8_AUTH_HEADER || "Authorization",
-    authScheme: process.env.SERVICEM8_AUTH_SCHEME || "Bearer"
+    authScheme: process.env.SERVICEM8_AUTH_SCHEME || "Bearer",
+    authLocation: (process.env.SERVICEM8_AUTH_LOCATION as "header" | "query") || "header"
   }
 };
 
@@ -57,10 +69,7 @@ function mcpError(id: any, code: number, message: string) {
   return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
-function authValue(config: {
-  apiKey?: string;
-  authScheme?: string;
-}) {
+function authValue(config: CrmConfig) {
   if (!config.apiKey) return "";
 
   if (!config.authScheme || config.authScheme.toLowerCase() === "none") {
@@ -71,13 +80,7 @@ function authValue(config: {
 }
 
 async function apiGet(
-  config: {
-    label: string;
-    baseUrl?: string;
-    apiKey?: string;
-    authHeader?: string;
-    authScheme?: string;
-  },
+  config: CrmConfig,
   path: string,
   query: Record<string, string | number | boolean | undefined> = {}
 ) {
@@ -97,7 +100,11 @@ async function apiGet(
     Accept: "application/json"
   };
 
-  headers[config.authHeader || "Authorization"] = authValue(config);
+  if (config.authLocation === "query") {
+    url.searchParams.set(config.authHeader || "api_key", config.apiKey);
+  } else {
+    headers[config.authHeader || "Authorization"] = authValue(config);
+  }
 
   const response = await fetch(url.toString(), {
     method: "GET",
@@ -269,7 +276,6 @@ async function zigaflowSearch(query: string, limit: number) {
 
   const results: any[] = [];
 
-  // Direct exact-match helpers
   if (query.includes("@")) {
     try {
       const contactByEmail = await apiGet(z, "/v1/contacts/getbyemail", { email: query });
@@ -286,7 +292,6 @@ async function zigaflowSearch(query: string, limit: number) {
     results.push({ type: "client_by_name", error: String(error) });
   }
 
-  // Broad list reads with local filtering
   const top = Math.min(Math.max(limit * 5, 25), 100);
 
   const sources = [
@@ -389,14 +394,10 @@ async function zigaflowRecentActivity(limit: number) {
 async function zigaflowFollowupsDue(window: string) {
   const z = crmConfig.zigaflow;
 
-  const output: any = {
-    window
-  };
+  const output: any = { window };
 
   try {
-    output.events = await apiGet(z, "/v1/events", {
-      top: 100
-    });
+    output.events = await apiGet(z, "/v1/events", { top: 100 });
   } catch (error) {
     output.eventsError = String(error);
   }
@@ -412,9 +413,7 @@ async function zigaflowFollowupsDue(window: string) {
   }
 
   try {
-    output.tickets = await apiGet(z, "/v1/tickets", {
-      top: 50
-    });
+    output.tickets = await apiGet(z, "/v1/tickets", { top: 50 });
   } catch (error) {
     output.ticketsError = String(error);
   }
@@ -428,9 +427,7 @@ async function zigaflowDailyDigest(date?: string) {
   const from = `${targetDate} 00:00`;
   const to = `${targetDate} 23:59`;
 
-  const output: any = {
-    date: targetDate
-  };
+  const output: any = { date: targetDate };
 
   const reads = [
     ["clientsCreated", "/v1/clients", { createdFrom: from, createdTo: to, top: 50 }],
@@ -469,7 +466,9 @@ async function callTool(name: string, args: any) {
     return Object.entries(crmConfig).map(([key, config]) => ({
       crm: key,
       label: config.label,
-      configured: Boolean(config.baseUrl && config.apiKey)
+      configured: Boolean(config.baseUrl && config.apiKey),
+      authLocation: config.authLocation || "header",
+      authHeader: config.authHeader || null
     }));
   }
 
@@ -541,7 +540,7 @@ async function callTool(name: string, args: any) {
         results.push({
           crm: "Zigaflow",
           ok: true,
-          data: await zigaflowRecentActivity(limit)
+          data: await zigafflowRecentActivitySafe(limit)
         });
       } catch (error) {
         results.push({ crm: "Zigaflow", ok: false, error: String(error) });
@@ -608,6 +607,11 @@ async function callTool(name: string, args: any) {
   }
 
   throw new Error(`Unknown tool: ${name}`);
+}
+
+// Kept separate so a typo is less likely to break the whole server.
+async function zigafflowRecentActivitySafe(limit: number) {
+  return zigaflowRecentActivity(limit);
 }
 
 app.get("/", (_req, res) => {
